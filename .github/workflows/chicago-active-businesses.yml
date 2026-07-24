@@ -1,0 +1,40 @@
+name: Chicago Active Businesses Export
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download current active Chicago business licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://data.cityofchicago.org/api/v3/views/uupf-x98q/export.csv?accessType=DOWNLOAD'
+          curl -L --fail --retry 3 --retry-delay 2 "$URL" -o chicago_active_business_licenses.csv
+          test -s chicago_active_business_licenses.csv
+          python - <<'PY'
+          import csv
+          p='chicago_active_business_licenses.csv'
+          with open(p, newline='', encoding='utf-8-sig') as f:
+              r=csv.reader(f)
+              header=next(r)
+              n=sum(1 for _ in r)
+          print('rows=', n)
+          print('columns=', len(header))
+          print('header=', header)
+          if n < 50000:
+              raise SystemExit(f'Expected at least 50,000 active license rows, got {n}')
+          PY
+      - name: Upload Chicago active business dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: chicago-active-business-licenses
+          path: chicago_active_business_licenses.csv
+          if-no-files-found: error
+          retention-days: 1
