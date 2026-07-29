@@ -1,4 +1,4 @@
-name: Combined Public Business Master Export
+name: Combined Public Business Contact Export
 
 on:
   pull_request:
@@ -10,12 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    timeout-minutes: 120
     steps:
-      - name: Download and normalize official public business datasets
+      - name: Download, normalize, deduplicate, and split official public business datasets
         shell: bash
         run: |
           set -euo pipefail
-          cat > build_master.py <<'PY'
+          cat > build_contacts.py <<'PY'
           import csv
           import json
           import os
@@ -23,15 +24,17 @@ jobs:
           import sqlite3
           import time
           from datetime import datetime, date
+          from urllib.parse import quote_plus
           from urllib.request import Request, urlopen
 
           TODAY = date(2026, 7, 29)
-          OUT = 'combined_public_business_master.csv'
           DB = 'master.sqlite'
+          CONTACTS = 'businesses_with_public_contacts.csv'
+          NEEDS = 'businesses_needing_contact_research.csv'
           STATS = 'source_stats.json'
 
           SOURCES = [
-              {'name':'Chicago Active Business Licenses','page':'https://data.cityofchicago.org/Community-Economic-Development/Business-Licenses-Current-Active/uupf-x98q','download':'https://data.cityofchicago.org/api/views/uupf-x98q/rows.csv?accessType=DOWNLOAD','kind':'chicago'},
+              {'name':'Chicago Active Business Licenses','page':'https://data.cityofchicago.org/Community-Economic-Development/Business-Licenses-Current-Active/uupf-x98q','download':'https://data.cityofchicago.org/api/v3/views/uupf-x98q/export.csv?accessType=DOWNLOAD','kind':'chicago'},
               {'name':'Los Angeles Active Businesses','page':'https://data.lacity.org/Administration-Finance/Listing-of-Active-Businesses/6rrh-rzua','download':'https://data.lacity.org/api/views/6rrh-rzua/rows.csv?accessType=DOWNLOAD','kind':'la'},
               {'name':'Seattle Active Business License Tax Certificates','page':'https://data.seattle.gov/City-Administration/Active-Business-License-Tax-Certificate/wnbq-64tb','download':'https://data.seattle.gov/api/views/wnbq-64tb/rows.csv?accessType=DOWNLOAD','kind':'seattle'},
               {'name':'San Francisco Registered Business Locations','page':'https://data.sfgov.org/Economy-and-Community/Registered-Business-Locations-San-Francisco/g8m3-pdis','download':'https://data.sfgov.org/api/views/g8m3-pdis/rows.csv?accessType=DOWNLOAD','kind':'sf'},
@@ -39,14 +42,39 @@ jobs:
               {'name':'Philadelphia Commercial Activity Licenses','page':'https://data.phila.gov/visualizations/li-commercial-activity-licenses/','download':'https://phl.carto.com/api/v2/sql?q=SELECT+%2A+FROM+com_act_licenses&filename=com_act_licenses&format=csv&skipfields=cartodb_id','kind':'philly'},
           ]
 
+          CATEGORY_RULES = [
+              ('Accounting / Financial Services',['account','bookkeep','tax','financial','insurance','credit','currency','loan','bank']),
+              ('Auto Services',['automotive','motor vehicle','auto repair','car wash','towing','tow truck','tire','garage','vehicle']),
+              ('Food / Beverage',['food','restaurant','liquor','tavern','cater','bakery','coffee','grocery','kitchen','beverage']),
+              ('Retail / Ecommerce / Beauty',['retail','clothing','apparel','beauty','hair','barber','salon','cosmetic','skin care','skincare','jewelry','gift']),
+              ('Health / Wellness / Care',['medical','health','wellness','massage','therapy','pharmacy','fitness','gym','home care','dental','chiropr']),
+              ('Home / Field Services',['construction','contractor','plumbing','roofing','electrical','cleaning','janitorial','landscap','pest','locksmith','demolition','painting','handyman','flooring','hvac']),
+              ('Education / Training',['education','school','academy','training','tutor','learning','child care','childcare','daycare']),
+              ('Pet / Agriculture',['pet','animal','kennel','grooming','veterinary','agricultur']),
+              ('Media / Creative / Entertainment',['media','entertainment','theater','theatre','photograph','art','music','dance','amusement','event']),
+              ('Nonprofit / Community',['nonprofit','non-profit','not-for-profit','charitable','foundation']),
+              ('Transportation / Travel',['transport','taxi','livery','freight','delivery','moving','travel','passenger']),
+              ('Technology',['computer','software','technology','telecom','data service','web development','internet']),
+              ('Legal / Document Services',['notary','legal','law office','document service']),
+              ('Real Estate',['real estate','realty','property management','brokerage']),
+              ('Professional / Consulting',['consult','marketing','professional service','business service','commercial office','administrative office']),
+          ]
+          SCORE = {
+              'Home / Field Services':94,'Real Estate':95,'Health / Wellness / Care':91,'Auto Services':94,
+              'Legal / Document Services':87,'Accounting / Financial Services':82,'Education / Training':86,
+              'Transportation / Travel':82,'Pet / Agriculture':84,'Professional / Consulting':84,
+              'Technology':68,'Food / Beverage':76,'Retail / Ecommerce / Beauty':78,
+              'Media / Creative / Entertainment':72,'Nonprofit / Community':69,'Other / Needs Review':60,
+          }
+
           def norm_header(s): return re.sub(r'[^a-z0-9]+','_', (s or '').strip().lower()).strip('_')
           def clean(s):
               if s is None: return ''
               return re.sub(r'\s+',' ',str(s).replace('\x00',' ').strip())
           def first(row,*names):
               for name in names:
-                  v=clean(row.get(name,''))
-                  if v: return v
+                  value=clean(row.get(name,''))
+                  if value: return value
               return ''
           def combine(*parts): return clean(' '.join(p for p in parts if clean(p)))
           def key_text(s): return re.sub(r'[^a-z0-9]+','',clean(s).casefold())
@@ -59,87 +87,128 @@ jobs:
                       except Exception: pass
               return None
           def download(url,path):
-              req=Request(url,headers={'User-Agent':'Mozilla/5.0 iLLCo-Public-Data-Builder/1.0'})
+              req=Request(url,headers={'User-Agent':'Mozilla/5.0 iLLCo-Public-Data-Builder/2.0'})
               for attempt in range(4):
                   try:
-                      with urlopen(req,timeout=180) as r, open(path,'wb') as f:
+                      with urlopen(req,timeout=300) as response, open(path,'wb') as output:
                           while True:
-                              chunk=r.read(1024*1024)
+                              chunk=response.read(1024*1024)
                               if not chunk: break
-                              f.write(chunk)
+                              output.write(chunk)
                       if os.path.getsize(path)<100: raise RuntimeError('download too small')
                       return
                   except Exception:
                       if attempt==3: raise
-                      time.sleep(3*(attempt+1))
-
+                      time.sleep(4*(attempt+1))
+          def illco_category(text):
+              s=clean(text).casefold()
+              for category,terms in CATEGORY_RULES:
+                  if any(term in s for term in terms): return category
+              return 'Other / Needs Review'
+          def priority(score):
+              if score>=95:return 'A+'
+              if score>=90:return 'A'
+              if score>=82:return 'B'
+              if score>=72:return 'C'
+              return 'D'
           def normalize_row(kind,r):
               if kind=='chicago':
-                  business=first(r,'doing_business_as_name','legal_name'); category=combine(first(r,'license_description'),first(r,'business_activity')); address=first(r,'address'); city=first(r,'city'); state=first(r,'state'); zipcode=first(r,'zip_code'); phone=''; active=first(r,'license_status').upper() in ('AAI','ACTIVE','')
+                  business=first(r,'doing_business_as_name','legal_name'); source_category=combine(first(r,'license_description'),first(r,'business_activity')); address=first(r,'address'); city=first(r,'city'); state=first(r,'state'); zipcode=first(r,'zip_code'); phone=''; email=''; website=''; active=first(r,'license_status').upper() in ('AAI','ACTIVE','')
               elif kind=='la':
-                  business=first(r,'dba_name','business_name'); category=first(r,'primary_naics_description','naics_description','naics'); address=first(r,'street_address','location_description'); city=first(r,'city'); state=first(r,'state') or 'CA'; zipcode=first(r,'zip_code'); phone=''; active=True
+                  business=first(r,'dba_name','business_name'); source_category=first(r,'primary_naics_description','naics_description','naics'); address=first(r,'street_address','location_description'); city=first(r,'city'); state=first(r,'state') or 'CA'; zipcode=first(r,'zip_code'); phone=first(r,'business_phone','phone_number','phone'); email=first(r,'email','business_email'); website=first(r,'website','web_address','url'); active=True
               elif kind=='seattle':
-                  business=first(r,'trade_name','business_legal_name'); category=first(r,'naics_description','naics_code'); address=first(r,'street_address'); city=first(r,'city'); state=first(r,'state'); zipcode=first(r,'zip'); phone=first(r,'business_phone'); active=True
+                  business=first(r,'trade_name','business_legal_name'); source_category=first(r,'naics_description','naics_code'); address=first(r,'street_address'); city=first(r,'city'); state=first(r,'state'); zipcode=first(r,'zip'); phone=first(r,'business_phone','phone'); email=first(r,'business_email','email'); website=first(r,'website','web_address','url'); active=True
               elif kind=='sf':
-                  business=first(r,'dba_name','ownership_name'); category=first(r,'naics_code','naics_code_description','naic_code_description'); address=first(r,'full_business_address','business_location','street_address'); city=first(r,'city') or 'San Francisco'; state=first(r,'state') or 'CA'; zipcode=first(r,'business_zip','zip_code','zip'); phone=first(r,'business_phone','phone'); end_dates=[parse_date(first(r,'location_end_date')),parse_date(first(r,'business_end_date'))]; active=all(d is None or d>TODAY for d in end_dates)
+                  business=first(r,'dba_name','ownership_name'); source_category=first(r,'naics_code_description','naic_code_description','naics_code'); address=first(r,'full_business_address','business_location','street_address'); city=first(r,'city') or 'San Francisco'; state=first(r,'state') or 'CA'; zipcode=first(r,'business_zip','zip_code','zip'); phone=first(r,'business_phone','phone'); email=first(r,'business_email','email'); website=first(r,'website','web_address','url'); end_dates=[parse_date(first(r,'location_end_date')),parse_date(first(r,'business_end_date'))]; active=all(d is None or d>TODAY for d in end_dates)
               elif kind=='nyc':
-                  business=first(r,'business_name_2','dba_trade_name','business_name'); category=first(r,'industry','business_category','license_type'); address=combine(first(r,'address_building','building_number'),first(r,'address_street_name','street1'),first(r,'street2'),first(r,'street3'),first(r,'apt_suite')); city=first(r,'address_city','city'); state=first(r,'address_state','state'); zipcode=first(r,'address_zip','zip_code','zip'); phone=first(r,'contact_phone'); status=first(r,'license_status').upper(); active=status in ('ACTIVE','READY FOR RENEWAL','')
+                  business=first(r,'business_name_2','dba_trade_name','business_name'); source_category=first(r,'industry','business_category','license_type'); address=combine(first(r,'address_building','building_number'),first(r,'address_street_name','street1'),first(r,'street2'),first(r,'street3'),first(r,'apt_suite')); city=first(r,'address_city','city'); state=first(r,'address_state','state'); zipcode=first(r,'address_zip','zip_code','zip'); phone=first(r,'contact_phone','phone'); email=first(r,'contact_email','email'); website=first(r,'website','web_address','url'); status=first(r,'license_status').upper(); active=status in ('ACTIVE','READY FOR RENEWAL','')
               elif kind=='philly':
-                  business=first(r,'companyname') or combine(first(r,'legalfirstname'),first(r,'legallastname')); category=first(r,'licensetype','legalentitytype') or 'Commercial Activity License'; address=first(r,'ownercontact1mailingaddress'); city=first(r,'ownercontact1city') or 'Philadelphia'; state=first(r,'ownercontact1state') or 'PA'; zipcode=first(r,'ownercontact1zippostalcode'); phone=first(r,'ownercontact1phone','phone'); status=first(r,'licensestatus').upper(); active=('ACTIVE' in status) or status in ('OPEN','')
+                  business=first(r,'companyname') or combine(first(r,'legalfirstname'),first(r,'legallastname')); source_category=first(r,'licensetype','legalentitytype') or 'Commercial Activity License'; address=first(r,'ownercontact1mailingaddress'); city=first(r,'ownercontact1city') or 'Philadelphia'; state=first(r,'ownercontact1state') or 'PA'; zipcode=first(r,'ownercontact1zippostalcode'); phone=first(r,'ownercontact1phone','phone'); email=first(r,'ownercontact1email','email'); website=first(r,'website','web_address','url'); status=first(r,'licensestatus').upper(); active=('ACTIVE' in status) or status in ('OPEN','')
               else: return None
               business=clean(business)
-              if not business or not active: return None
-              return [business,clean(category),clean(address),clean(city),clean(state),clean(zipcode),clean(phone)]
+              if not business or not active:return None
+              category=illco_category(combine(business,source_category))
+              score=SCORE[category]
+              return [business,category,clean(source_category),clean(address),clean(city),clean(state),clean(zipcode),clean(phone),clean(email),clean(website),score,priority(score)]
 
           if os.path.exists(DB): os.unlink(DB)
-          conn=sqlite3.connect(DB)
-          conn.execute('PRAGMA journal_mode=WAL'); conn.execute('PRAGMA synchronous=NORMAL')
-          conn.execute('CREATE TABLE master (dedupe_key TEXT PRIMARY KEY, source_url TEXT NOT NULL, business TEXT NOT NULL, category TEXT, address TEXT, city TEXT, state TEXT, zip TEXT, phone TEXT)')
+          connection=sqlite3.connect(DB)
+          connection.execute('PRAGMA journal_mode=WAL')
+          connection.execute('PRAGMA synchronous=NORMAL')
+          connection.execute('''CREATE TABLE master (
+              dedupe_key TEXT PRIMARY KEY, source_url TEXT NOT NULL, business TEXT NOT NULL,
+              illco_category TEXT, source_category TEXT, address TEXT, city TEXT, state TEXT, zip TEXT,
+              phone TEXT, email TEXT, website TEXT, score INTEGER, priority TEXT
+          )''')
           stats={}
-          for src in SOURCES:
-              path=f"{src['kind']}.csv"; print('Downloading',src['name'],flush=True); download(src['download'],path)
+          for source in SOURCES:
+              path=f"{source['kind']}.csv"
+              print('Downloading',source['name'],flush=True)
+              download(source['download'],path)
               read_count=active_count=inserted_count=0
-              with open(path,newline='',encoding='utf-8-sig',errors='replace') as f:
-                  reader0=csv.DictReader(f)
-                  if not reader0.fieldnames: raise RuntimeError(f"No headers for {src['name']}")
-                  mapping={h:norm_header(h) for h in reader0.fieldnames}
+              with open(path,newline='',encoding='utf-8-sig',errors='replace') as handle:
+                  reader0=csv.DictReader(handle)
+                  if not reader0.fieldnames: raise RuntimeError(f"No headers for {source['name']}")
+                  mapping={header:norm_header(header) for header in reader0.fieldnames}
                   for raw in reader0:
-                      read_count+=1; r={mapping[k]:v for k,v in raw.items() if k is not None}; normalized=normalize_row(src['kind'],r)
+                      read_count+=1
+                      row={mapping[key]:value for key,value in raw.items() if key is not None}
+                      normalized=normalize_row(source['kind'],row)
                       if not normalized: continue
-                      active_count+=1; business,category,address,city,state,zipcode,phone=normalized
+                      active_count+=1
+                      business,category,source_category,address,city,state,zipcode,phone,email,website,score,prio=normalized
                       dedupe_key='|'.join([key_text(business),key_text(address),key_text(city),key_text(state)])
                       if not dedupe_key.replace('|',''): continue
-                      before=conn.total_changes
-                      conn.execute('INSERT OR IGNORE INTO master (dedupe_key,source_url,business,category,address,city,state,zip,phone) VALUES (?,?,?,?,?,?,?,?,?)',(dedupe_key,src['page'],business,category,address,city,state,zipcode,phone))
-                      if conn.total_changes>before: inserted_count+=1
+                      before=connection.total_changes
+                      connection.execute('INSERT OR IGNORE INTO master VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(dedupe_key,source['page'],business,category,source_category,address,city,state,zipcode,phone,email,website,score,prio))
+                      if connection.total_changes>before:
+                          inserted_count+=1
                       else:
-                          conn.execute("UPDATE master SET source_url=CASE WHEN instr(source_url,?)=0 THEN source_url||' | '||? ELSE source_url END, phone=CASE WHEN phone='' AND ?<>'' THEN ? ELSE phone END, category=CASE WHEN category='' AND ?<>'' THEN ? ELSE category END WHERE dedupe_key=?",(src['page'],src['page'],phone,phone,category,category,dedupe_key))
-                      if read_count%25000==0: conn.commit(); print(src['name'],'rows',read_count,'active',active_count,flush=True)
-              conn.commit(); stats[src['name']]={'source_url':src['page'],'raw_rows':read_count,'active_rows':active_count,'new_unique_rows':inserted_count}; print(src['name'],stats[src['name']],flush=True)
+                          connection.execute('''UPDATE master SET
+                              source_url=CASE WHEN instr(source_url,?)=0 THEN source_url||' | '||? ELSE source_url END,
+                              phone=CASE WHEN phone='' AND ?<>'' THEN ? ELSE phone END,
+                              email=CASE WHEN email='' AND ?<>'' THEN ? ELSE email END,
+                              website=CASE WHEN website='' AND ?<>'' THEN ? ELSE website END,
+                              source_category=CASE WHEN source_category='' AND ?<>'' THEN ? ELSE source_category END
+                              WHERE dedupe_key=?''',(source['page'],source['page'],phone,phone,email,email,website,website,source_category,source_category,dedupe_key))
+                      if read_count%25000==0:
+                          connection.commit()
+                          print(source['name'],'rows',read_count,'active',active_count,flush=True)
+              connection.commit()
+              stats[source['name']]={'source_url':source['page'],'raw_rows':read_count,'active_rows':active_count,'new_unique_rows':inserted_count}
+              print(source['name'],stats[source['name']],flush=True)
 
-          final_rows=conn.execute('SELECT COUNT(*) FROM master').fetchone()[0]
-          max_rows=1249000
-          if final_rows>max_rows: raise RuntimeError(f'Combined unique rows {final_rows} exceed one-sheet capacity {max_rows}')
-          with open(OUT,'w',newline='',encoding='utf-8') as f:
-              writer=csv.writer(f); writer.writerow(['Source URL','Business','Category / Industry','Address','City','State','ZIP','Public Phone'])
-              cur=conn.execute('SELECT source_url,business,category,address,city,state,zip,phone FROM master ORDER BY state,city,business')
+          columns=['Source URL','Business','iLLCo Category','Source Category / Industry','Address','City','State','ZIP','Public Phone','Public Email','Website','Opportunity Score','Priority','Contact Status','Contact Search URL']
+          contact_count=needs_count=0
+          with open(CONTACTS,'w',newline='',encoding='utf-8') as contacts_file, open(NEEDS,'w',newline='',encoding='utf-8') as needs_file:
+              contacts_writer=csv.writer(contacts_file); needs_writer=csv.writer(needs_file)
+              contacts_writer.writerow(columns); needs_writer.writerow(columns)
+              cursor=connection.execute('SELECT source_url,business,illco_category,source_category,address,city,state,zip,phone,email,website,score,priority FROM master ORDER BY priority,state,city,business')
               while True:
-                  rows=cur.fetchmany(10000)
+                  rows=cursor.fetchmany(10000)
                   if not rows: break
-                  writer.writerows(rows)
-          stats['Combined Master']={'unique_rows':final_rows,'columns':8,'google_sheets_cells':(final_rows+1)*8,'built_on':'2026-07-29'}
-          with open(STATS,'w',encoding='utf-8') as f: json.dump(stats,f,indent=2)
+                  for row in rows:
+                      source_url,business,category,source_category,address,city,state,zipcode,phone,email,website,score,prio=row
+                      query=f'"{business}" "{city}" "{state}" official website phone email contact'
+                      search_url='https://www.bing.com/search?q='+quote_plus(query)
+                      if phone or email or website:
+                          contacts_writer.writerow(list(row)+['Public contact in official dataset',search_url]); contact_count+=1
+                      else:
+                          needs_writer.writerow(list(row)+['Contact research required',search_url]); needs_count+=1
+          stats['Combined Master']={'unique_business_locations':contact_count+needs_count,'with_public_contact':contact_count,'needs_contact_research':needs_count,'built_on':'2026-07-29'}
+          with open(STATS,'w',encoding='utf-8') as stats_file:json.dump(stats,stats_file,indent=2)
           print(json.dumps(stats,indent=2),flush=True)
           PY
-          python build_master.py
-          ls -lh combined_public_business_master.csv source_stats.json
+          python build_contacts.py
+          ls -lh businesses_with_public_contacts.csv businesses_needing_contact_research.csv source_stats.json
 
-      - name: Upload combined one-sheet dataset
+      - name: Upload split contact-status datasets
         uses: actions/upload-artifact@v4
         with:
-          name: combined-public-business-master
+          name: combined-public-business-contact-master
           path: |
-            combined_public_business_master.csv
+            businesses_with_public_contacts.csv
+            businesses_needing_contact_research.csv
             source_stats.json
           retention-days: 1
           if-no-files-found: error
